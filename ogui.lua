@@ -13,6 +13,9 @@
     • Per-element granular control (party, target, chat1, chat2)
     • Fishing HP bar workaround (party0 auto-shows on hook, hides on end)
     • Chat window toggle support (discovered via live memory scan)
+    • Target bar layout pinning (prevents shift when party is hidden)
+    • Custom 3D sprite cursors when the native target bar is hidden
+      (D3D8 world-to-screen overlay, adapted from customtarget by Jyouya)
     • Diagnostic scan/test tools for future pointer discovery
     • Settings persistence across sessions
 
@@ -71,6 +74,13 @@ require('common');
 local chat     = require('chat');
 local imgui    = require('imgui');
 local settings = require('settings');
+local d3d      = require('d3d8');
+local ffi      = require('ffi');
+local C        = ffi.C;
+local d3d8dev  = d3d.get_device();
+local _, _vp   = d3d8dev:GetViewport();
+local _SCR_W   = _vp.Width;
+local _SCR_H   = _vp.Height;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Configuration defaults
@@ -93,6 +103,8 @@ local defaults = T{
     hide_unk7D  = false,
     hide_unk87  = false,
     hide_unk91  = false,
+    -- Custom cursor overlay (only active when hide_target = true)
+    show_cursors = true,
 };
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -103,6 +115,9 @@ local ogui = T{
     settings         = defaults:copy(),
     show_window      = T{ false },
     fishing_active   = false,
+    cursor_sprite    = nil,
+    cursor_tex       = nil,
+    cursor_tex_sub   = nil,
 
     ptrs = T{
         chat1  = 0,   -- ptr1+0x0F
@@ -210,6 +225,116 @@ local function apply()
     set_vis(ogui.ptrs.unk91,  s.hide_unk91  and 0 or 1);
     set_party_vis(ogui.ptrs.party1, s.hide_party and 0 or 1);
     set_party_vis(ogui.ptrs.party2, s.hide_party and 0 or 1);
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Custom target cursor overlay
+-- Draws PNG sprite cursors over the target / subtarget in 3D world space.
+-- Only active when hide_target is true AND show_cursors is true.
+-- Adapted from customtarget by Jyouya (MIT).
+-- Assets: cursor.png (main), subcursor.png (sub/blue) in the ogui folder.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local CURSOR_W   = 30;
+local CURSOR_H   = 20;
+local _cr_rect   = ffi.new('RECT',        { 0, 0, CURSOR_W, CURSOR_H });
+local _cr_white  = d3d.D3DCOLOR_ARGB(255, 255, 255, 255);
+local _cr_pos    = ffi.new('D3DXVECTOR2', { 0, 0 });
+local _cr_pos_s  = ffi.new('D3DXVECTOR2', { 0, 0 });
+local _cr_scale  = ffi.new('D3DXVECTOR2', { 1.0, 1.0 });
+
+local function _cr_mat_mul(m1, m2)
+    return ffi.new('D3DXMATRIX', {
+        m1._11*m2._11 + m1._12*m2._21 + m1._13*m2._31 + m1._14*m2._41,
+        m1._11*m2._12 + m1._12*m2._22 + m1._13*m2._32 + m1._14*m2._42,
+        m1._11*m2._13 + m1._12*m2._23 + m1._13*m2._33 + m1._14*m2._43,
+        m1._11*m2._14 + m1._12*m2._24 + m1._13*m2._34 + m1._14*m2._44,
+        m1._21*m2._11 + m1._22*m2._21 + m1._23*m2._31 + m1._24*m2._41,
+        m1._21*m2._12 + m1._22*m2._22 + m1._23*m2._32 + m1._24*m2._42,
+        m1._21*m2._13 + m1._22*m2._23 + m1._23*m2._33 + m1._24*m2._43,
+        m1._21*m2._14 + m1._22*m2._24 + m1._23*m2._34 + m1._24*m2._44,
+        m1._31*m2._11 + m1._32*m2._21 + m1._33*m2._31 + m1._34*m2._41,
+        m1._31*m2._12 + m1._32*m2._22 + m1._33*m2._32 + m1._34*m2._42,
+        m1._31*m2._13 + m1._32*m2._23 + m1._33*m2._33 + m1._34*m2._43,
+        m1._31*m2._14 + m1._32*m2._24 + m1._33*m2._34 + m1._34*m2._44,
+        m1._41*m2._11 + m1._42*m2._21 + m1._43*m2._31 + m1._44*m2._41,
+        m1._41*m2._12 + m1._42*m2._22 + m1._43*m2._32 + m1._44*m2._42,
+        m1._41*m2._13 + m1._42*m2._23 + m1._43*m2._33 + m1._44*m2._43,
+        m1._41*m2._14 + m1._42*m2._24 + m1._43*m2._34 + m1._44*m2._44,
+    });
+end
+
+local function _cr_vec4_xform(v, m)
+    return ffi.new('D3DXVECTOR4', {
+        m._11*v.x + m._21*v.y + m._31*v.z + m._41*v.w,
+        m._12*v.x + m._22*v.y + m._32*v.z + m._42*v.w,
+        m._13*v.x + m._23*v.y + m._33*v.z + m._43*v.w,
+        m._14*v.x + m._24*v.y + m._34*v.z + m._44*v.w,
+    });
+end
+
+local function cursor_world_to_screen(x, y, z, view, proj)
+    local p  = _cr_vec4_xform(
+                    ffi.new('D3DXVECTOR4', { x, y, z, 1 }),
+                    _cr_mat_mul(view, proj));
+    local rw = 1 / p.w;
+    return math.floor((p.x * rw + 1) * 0.5 * _SCR_W),
+           math.floor((1 - p.y * rw) * 0.5 * _SCR_H),
+           p.z * rw;
+end
+
+local function cursor_get_bone(actor_ptr, bone)
+    local bx  = ashita.memory.read_float(actor_ptr + 0x678);
+    local by  = ashita.memory.read_float(actor_ptr + 0x680);
+    local bz  = ashita.memory.read_float(actor_ptr + 0x67C);
+    local sk  = ashita.memory.read_uint32(actor_ptr + 0x6B8);
+    local sko = ashita.memory.read_uint32(sk + 0x0C);
+    local ska = ashita.memory.read_uint32(sko);
+    local cnt = ashita.memory.read_uint16(ska + 0x32);
+    local gen = ska + 0x30 + 0x04 + 0x1E * cnt + 4;
+    return bx + ashita.memory.read_float(gen + bone * 0x1A + 0x0E + 0x0),
+           by + ashita.memory.read_float(gen + bone * 0x1A + 0x0E + 0x8),
+           bz + ashita.memory.read_float(gen + bone * 0x1A + 0x0E + 0x4);
+end
+
+local function cursor_get_pos(tidx)
+    local e      = AshitaCore:GetMemoryManager():GetEntity();
+    local etype  = e:GetType(tidx);
+    local rflags = e:GetRenderFlags0(tidx);
+    local tx, ty, tz;
+    if (etype == 3) then
+        tx = e:GetLocalPositionX(tidx);
+        ty = e:GetLocalPositionY(tidx);
+        tz = e:GetLocalPositionZ(tidx);
+    elseif (rflags == 0 and etype == 0) then
+        tx = e:GetLastPositionX(tidx);
+        ty = e:GetLastPositionY(tidx);
+        tz = e:GetLastPositionZ(tidx);
+    else
+        local aptr = e:GetActorPointer(tidx);
+        tx, ty, tz = cursor_get_bone(aptr, 2);
+    end
+    local _, view = d3d8dev:GetTransform(C.D3DTS_VIEW);
+    local _, proj = d3d8dev:GetTransform(C.D3DTS_PROJECTION);
+    local sx, sy, nz = cursor_world_to_screen(tx, tz, ty, view, proj);
+    sx = sx - CURSOR_W / 2;
+    sy = sy - CURSOR_H;
+    if (etype == 3) then sy = sy - 8; end
+    return sx, sy, nz;
+end
+
+local function cursor_load_tex(filename)
+    local tp = ffi.new('IDirect3DTexture8*[1]');
+    if (C.D3DXCreateTextureFromFileA(d3d8dev, addon.path .. filename, tp) ~= C.S_OK) then
+        return nil;
+    end
+    return d3d.gc_safe_release(ffi.cast('IDirect3DTexture8*', tp[0]));
+end
+
+local function cursor_init_sprite()
+    local sp = ffi.new('ID3DXSprite*[1]');
+    if (C.D3DXCreateSprite(d3d8dev, sp) ~= C.S_OK) then return nil; end
+    return d3d.gc_safe_release(ffi.cast('ID3DXSprite*', sp[0]));
 end
 
 --[[
@@ -446,6 +571,7 @@ ashita.events.register('load', 'load_cb', function ()
     ogui.ptrs.party2 = ashita.memory.read_uint32(ptr2 + 0x07);
 
     show_all();
+    ogui.cursor_sprite = cursor_init_sprite();
     print(chat.header(addon.name):append(chat.message('Loaded.  Type /ogui to open settings.')));
 end);
 
@@ -550,6 +676,41 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 
     apply();
 
+    -- Draw custom target cursors when the native target bar is hidden
+    if (ogui.settings.active and ogui.settings.hide_target and ogui.settings.show_cursors
+            and ogui.cursor_sprite ~= nil) then
+        local tgt    = AshitaCore:GetMemoryManager():GetTarget();
+        local is_sub = tgt:GetIsSubTargetActive();
+        if (tgt:GetIsActive(is_sub) ~= 0) then
+            ogui.cursor_tex     = ogui.cursor_tex     or cursor_load_tex('cursor.png');
+            ogui.cursor_tex_sub = ogui.cursor_tex_sub or cursor_load_tex('subcursor.png');
+
+            local tidx     = tgt:GetTargetIndex(is_sub);
+            local tidx_sub = (is_sub == 1) and tgt:GetTargetIndex(0) or nil;
+
+            local px, py, pz = cursor_get_pos(tidx);
+            _cr_pos.x = px;
+            _cr_pos.y = py;
+            if (pz >= 0 and pz <= 1) then
+                local flags = tgt:GetSubTargetFlags();
+                if ((flags == 512 or flags == 18 or flags == 525) and tidx_sub == nil) then
+                    ogui.cursor_sprite:Draw(ogui.cursor_tex_sub, _cr_rect, _cr_scale, nil, 0.0, _cr_pos, _cr_white);
+                else
+                    ogui.cursor_sprite:Draw(ogui.cursor_tex,     _cr_rect, _cr_scale, nil, 0.0, _cr_pos, _cr_white);
+                end
+            end
+
+            if (tidx_sub ~= nil) then
+                local sx, sy, sz = cursor_get_pos(tidx_sub);
+                _cr_pos_s.x = sx;
+                _cr_pos_s.y = sy - 10;
+                if (sz >= 0 and sz <= 1) then
+                    ogui.cursor_sprite:Draw(ogui.cursor_tex_sub, _cr_rect, _cr_scale, nil, 0.0, _cr_pos_s, _cr_white);
+                end
+            end
+        end
+    end
+
     if (not ogui.show_window[1]) then return; end
 
     imgui.SetNextWindowSize({ 290, 0 }, ImGuiCond_FirstUseEver);
@@ -598,6 +759,18 @@ ashita.events.register('d3d_present', 'present_cb', function ()
             'selection cursors, conquest /\n' ..
             'imperial standing, and related\n' ..
             'misc elements.');
+
+        if (ogui.settings.hide_target) then
+            imgui.Indent(16);
+            toggle('Custom target cursors', 'show_cursors',
+                'Draws 3D sprite cursors over your\n' ..
+                'target and subtarget when the\n' ..
+                'native target bar is hidden.\n\n' ..
+                'Uses cursor.png and subcursor.png\n' ..
+                'in the ogui addon folder.\n' ..
+                'Replace them to customise the look.');
+            imgui.Unindent(16);
+        end
 
         -- ── Chat ─────────────────────────────────────────────────────────────
         section('Chat');
